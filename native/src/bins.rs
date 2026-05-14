@@ -1,7 +1,9 @@
+use crate::auth::{ensure_fresh_session, trim_trailing_slash};
 use crate::config::{load_config, save_config, AppPaths};
 use crate::error::{AppError, AppResult};
 use crate::state::{emit_state, log_line, ManagedState};
 use reqwest::header::{ACCEPT, USER_AGENT};
+use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,6 +56,28 @@ struct GitHubReleaseAsset {
     browser_download_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ApiResponse<T> {
+    success: bool,
+    data: Option<T>,
+    error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MiruRendererManifestResponse {
+    version: String,
+    file_name: String,
+    size_bytes: u64,
+    updated_at: Option<String>,
+    sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RendererManifest {
@@ -94,7 +118,9 @@ struct RendererManifestAsset {
 #[derive(Debug, Clone)]
 struct ResolvedRendererRelease {
     release_url: String,
-    binary_asset: GitHubReleaseAsset,
+    download_url: String,
+    download_auth_token: Option<String>,
+    asset_name: String,
     manifest: RendererManifest,
 }
 
@@ -114,7 +140,21 @@ pub async fn renderer_download_info(app: &AppHandle) -> AppResult<RendererDownlo
         });
     }
 
-    let resolved = fetch_latest_renderer_release(&state.http).await?;
+    let resolved = match fetch_latest_renderer_release(app).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Some((manifest, install_path)) = verified_managed_renderer(&state.paths) {
+                return Ok(RendererDownloadInfo {
+                    version: manifest.version,
+                    size_bytes: manifest.size_bytes,
+                    install_path,
+                    already_available: true,
+                    release_url: String::new(),
+                });
+            }
+            return Err(error);
+        }
+    };
     let install_path = managed_renderer_path(&state.paths, &resolved.manifest);
     let already_available =
         verify_file_sha256(&install_path, &resolved.manifest.sha256).unwrap_or(false);
@@ -131,7 +171,7 @@ pub async fn renderer_download_info(app: &AppHandle) -> AppResult<RendererDownlo
 pub async fn renderer_update_status(app: &AppHandle) -> AppResult<RendererUpdateStatus> {
     let state = app.state::<ManagedState>();
     let config = load_config(&state.paths)?;
-    let resolved = fetch_latest_renderer_release(&state.http).await?;
+    let resolved = fetch_latest_renderer_release(app).await?;
 
     if let Some(path) = custom_renderer_override(&state.paths, &config.renderer_override_path) {
         return Ok(RendererUpdateStatus {
@@ -141,7 +181,7 @@ pub async fn renderer_update_status(app: &AppHandle) -> AppResult<RendererUpdate
             installed: true,
             custom_override: true,
             release_url: resolved.release_url,
-            asset_name: resolved.binary_asset.name,
+            asset_name: resolved.asset_name,
             size_bytes: resolved.manifest.size_bytes,
             install_path: path.display().to_string(),
         });
@@ -168,7 +208,7 @@ pub async fn renderer_update_status(app: &AppHandle) -> AppResult<RendererUpdate
         installed,
         custom_override: false,
         release_url: resolved.release_url,
-        asset_name: resolved.binary_asset.name,
+        asset_name: resolved.asset_name,
         size_bytes: resolved.manifest.size_bytes,
         install_path: install_path.display().to_string(),
     })
@@ -181,7 +221,22 @@ pub async fn ensure_renderer(app: &AppHandle) -> AppResult<PathBuf> {
         return Ok(path);
     }
 
-    let resolved = fetch_latest_renderer_release(&state.http).await?;
+    if let Some((_manifest, install_path)) = verified_managed_renderer(&state.paths) {
+        persist_managed_renderer_path(app, &install_path)?;
+        return Ok(install_path);
+    }
+
+    install_latest_renderer(app).await
+}
+
+pub async fn install_latest_renderer(app: &AppHandle) -> AppResult<PathBuf> {
+    let state = app.state::<ManagedState>();
+    let config = load_config(&state.paths)?;
+    if let Some(path) = custom_renderer_override(&state.paths, &config.renderer_override_path) {
+        return Ok(path);
+    }
+
+    let resolved = fetch_latest_renderer_release(app).await?;
     let renderer_path = managed_renderer_path(&state.paths, &resolved.manifest);
     if verify_file_sha256(&renderer_path, &resolved.manifest.sha256).unwrap_or(false) {
         persist_managed_renderer_manifest(&state.paths, &resolved.manifest)?;
@@ -197,13 +252,14 @@ pub async fn ensure_renderer(app: &AppHandle) -> AppResult<PathBuf> {
             format_bytes(resolved.manifest.size_bytes)
         ),
     );
-    let response = state
+    let mut request = state
         .http
-        .get(&resolved.binary_asset.browser_download_url)
-        .header(USER_AGENT, RENDERER_USER_AGENT)
-        .send()
-        .await?
-        .error_for_status()?;
+        .get(&resolved.download_url)
+        .header(USER_AGENT, RENDERER_USER_AGENT);
+    if let Some(token) = resolved.download_auth_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
 
     if bytes.len() as u64 != resolved.manifest.size_bytes {
@@ -235,9 +291,77 @@ pub async fn ensure_renderer(app: &AppHandle) -> AppResult<PathBuf> {
     Ok(renderer_path)
 }
 
-async fn fetch_latest_renderer_release(
-    client: &reqwest::Client,
+async fn fetch_latest_renderer_release(app: &AppHandle) -> AppResult<ResolvedRendererRelease> {
+    let state = app.state::<ManagedState>();
+    match fetch_miru_renderer_release(app, &state.http).await {
+        Ok(resolved) => Ok(resolved),
+        Err(error) => {
+            log_line(
+                app,
+                format!("Miru renderer API unavailable; falling back to GitHub Releases: {error}"),
+            );
+            fetch_github_renderer_release(&state.http).await
+        }
+    }
+}
+
+async fn fetch_miru_renderer_release(
+    app: &AppHandle,
+    client: &Client,
 ) -> AppResult<ResolvedRendererRelease> {
+    let token = ensure_fresh_session(app)
+        .await?
+        .ok_or_else(|| AppError::Auth("login required to download renderer".to_string()))?;
+    let state = app.state::<ManagedState>();
+    let config = load_config(&state.paths)?;
+    let api_url = trim_trailing_slash(&config.api_url);
+    let manifest_url = format!("{api_url}/client-binaries/renderer/windows/manifest");
+    let download_url = format!("{api_url}/client-binaries/renderer/windows/download");
+    let body: ApiResponse<MiruRendererManifestResponse> = client
+        .get(&manifest_url)
+        .bearer_auth(&token)
+        .header(USER_AGENT, RENDERER_USER_AGENT)
+        .header(ACCEPT, "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    if !body.success {
+        return Err(AppError::Api(
+            body.error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "renderer manifest request failed".to_string()),
+        ));
+    }
+
+    let data = body
+        .data
+        .ok_or_else(|| AppError::Api("renderer manifest response had no data".to_string()))?;
+    let manifest = RendererManifest {
+        version: data.version,
+        renderer_commit: data
+            .updated_at
+            .clone()
+            .unwrap_or_else(|| "miru-api-renderer-binary".to_string()),
+        platform: WINDOWS_PLATFORM.to_string(),
+        asset_name: data.file_name,
+        size_bytes: data.size_bytes,
+        sha256: data.sha256,
+    };
+    validate_cached_manifest(&manifest)?;
+
+    Ok(ResolvedRendererRelease {
+        release_url: download_url.clone(),
+        download_url,
+        download_auth_token: Some(token),
+        asset_name: manifest.asset_name.clone(),
+        manifest,
+    })
+}
+
+async fn fetch_github_renderer_release(client: &Client) -> AppResult<ResolvedRendererRelease> {
     let release: GitHubRelease = client
         .get(RENDERER_RELEASE_API_URL)
         .header(USER_AGENT, RENDERER_USER_AGENT)
@@ -268,7 +392,9 @@ async fn fetch_latest_renderer_release(
 
     Ok(ResolvedRendererRelease {
         release_url: release.html_url,
-        binary_asset,
+        download_url: binary_asset.browser_download_url.clone(),
+        download_auth_token: None,
+        asset_name: binary_asset.name,
         manifest,
     })
 }
@@ -354,10 +480,21 @@ fn release_asset<'a>(
 }
 
 fn validate_manifest(release: &GitHubRelease, manifest: &RendererManifest) -> AppResult<()> {
+    validate_cached_manifest(manifest)?;
     if !manifest.platform.eq_ignore_ascii_case(WINDOWS_PLATFORM) {
         return Err(AppError::Binary(format!(
             "renderer release {} asset platform {} is not supported by the Windows client",
             release.tag_name, manifest.platform
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cached_manifest(manifest: &RendererManifest) -> AppResult<()> {
+    if !manifest.platform.eq_ignore_ascii_case(WINDOWS_PLATFORM) {
+        return Err(AppError::Binary(format!(
+            "renderer asset platform {} is not supported by the Windows client",
+            manifest.platform
         )));
     }
     if !manifest
@@ -365,8 +502,7 @@ fn validate_manifest(release: &GitHubRelease, manifest: &RendererManifest) -> Ap
         .eq_ignore_ascii_case(WINDOWS_RENDERER_ASSET_NAME)
     {
         return Err(AppError::Binary(format!(
-            "renderer release {} must expose {WINDOWS_RENDERER_ASSET_NAME} for the Windows client",
-            release.tag_name
+            "renderer asset must be {WINDOWS_RENDERER_ASSET_NAME} for the Windows client"
         )));
     }
     if !is_safe_asset_name(&manifest.asset_name) {
@@ -390,6 +526,17 @@ fn validate_manifest(release: &GitHubRelease, manifest: &RendererManifest) -> Ap
         ));
     }
     Ok(())
+}
+
+fn verified_managed_renderer(paths: &AppPaths) -> Option<(RendererManifest, PathBuf)> {
+    let manifest = read_managed_renderer_manifest(paths)?;
+    validate_cached_manifest(&manifest).ok()?;
+    let install_path = managed_renderer_path(paths, &manifest);
+    if verify_file_sha256(&install_path, &manifest.sha256).ok()? {
+        Some((manifest, install_path))
+    } else {
+        None
+    }
 }
 
 fn managed_renderer_path(paths: &AppPaths, manifest: &RendererManifest) -> PathBuf {

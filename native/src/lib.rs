@@ -403,7 +403,10 @@ async fn check_renderer_update(app: AppHandle) -> AppResult<bins::RendererUpdate
 
 #[tauri::command]
 async fn install_renderer_update(app: AppHandle) -> AppResult<String> {
-    Ok(bins::ensure_renderer(&app).await?.display().to_string())
+    Ok(bins::install_latest_renderer(&app)
+        .await?
+        .display()
+        .to_string())
 }
 
 #[tauri::command]

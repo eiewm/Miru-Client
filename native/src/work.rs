@@ -32,7 +32,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout, Instant as TokioInstant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -46,6 +46,9 @@ const MAX_BENCHMARK_REPLAY_SECONDS: u32 = 30;
 const DEFAULT_PUBLIC_SLOT_TOTAL: i64 = 5;
 const WORKER_PROTOCOL_VERSION: u8 = 3;
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const WORKER_SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const WORKER_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MACHINE_ID_HEADER: &str = "x-miru-machine-id";
 const MAX_SERVER_NAME_CHARS: usize = 18;
@@ -70,6 +73,12 @@ const MIRU_AUTOPLAY_COUNTRY_CODE: &str = "EC";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 type RendererOutputTail = Arc<AsyncMutex<String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerSocketExit {
+    Shutdown,
+    Closed,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -636,14 +645,21 @@ pub async fn connect_worker(app: AppHandle) -> AppResult<()> {
         emit_state(&app);
     }
 
-    {
+    let reconnecting_stale_local_socket = {
         let runtime = state.runtime.lock().expect("runtime state poisoned");
-        if matches!(
-            runtime.worker_status,
-            WorkerStatus::Connected | WorkerStatus::Connecting
-        ) {
+        if matches!(runtime.worker_status, WorkerStatus::Connecting) {
             return Ok(());
         }
+        if matches!(runtime.worker_status, WorkerStatus::Connected) && status.is_online {
+            return Ok(());
+        }
+        matches!(runtime.worker_status, WorkerStatus::Connected) && !status.is_online
+    };
+    if reconnecting_stale_local_socket {
+        log_line(
+            &app,
+            "Worker looked connected locally but server marked it offline; reconnecting",
+        );
     }
 
     let worker_token = renew_worker_token(&app, &token).await?;
@@ -662,11 +678,20 @@ pub async fn connect_worker(app: AppHandle) -> AppResult<()> {
             worker_socket_loop(app_for_task.clone(), worker_token, cancel_rx, ready_tx).await;
         replace_worker_cancel(&app_for_task, None);
         set_active_job_id(&app_for_task, None);
-        if let Err(err) = result {
-            log_line(&app_for_task, format!("Worker socket error: {err}"));
-            set_worker_status(&app_for_task, WorkerStatus::Error);
-        } else {
-            set_worker_status(&app_for_task, WorkerStatus::Disconnected);
+        match result {
+            Ok(WorkerSocketExit::Shutdown) => {
+                set_worker_status(&app_for_task, WorkerStatus::Disconnected);
+            }
+            Ok(WorkerSocketExit::Closed) => {
+                log_line(&app_for_task, "Worker socket closed by remote");
+                set_worker_status(&app_for_task, WorkerStatus::Disconnected);
+                schedule_worker_reconnect(app_for_task.clone(), "socket closed");
+            }
+            Err(err) => {
+                log_line(&app_for_task, format!("Worker socket error: {err}"));
+                set_worker_status(&app_for_task, WorkerStatus::Error);
+                schedule_worker_reconnect(app_for_task.clone(), "socket error");
+            }
         }
     });
 
@@ -722,6 +747,53 @@ pub async fn disconnect_worker(app: AppHandle) -> AppResult<()> {
     set_worker_status(&app, WorkerStatus::Disconnected);
     log_line(&app, "Worker disconnected");
     Ok(())
+}
+
+fn should_auto_reconnect_worker(app: &AppHandle) -> bool {
+    let state = app.state::<ManagedState>();
+    let Ok(config) = load_config(&state.paths) else {
+        return false;
+    };
+
+    config.server_auto_reconnect
+        && config.connect_worker_on_launch
+        && config.is_server
+        && config.registered_user_id == config.user_id
+}
+
+fn schedule_worker_reconnect(app: AppHandle, reason: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        let mut delay = WORKER_RECONNECT_INITIAL_DELAY;
+        loop {
+            if !should_auto_reconnect_worker(&app) {
+                break;
+            }
+
+            log_line(
+                &app,
+                format!(
+                    "Worker will reconnect in {}s after {reason}",
+                    delay.as_secs()
+                ),
+            );
+            sleep(delay).await;
+
+            if !should_auto_reconnect_worker(&app) {
+                break;
+            }
+
+            match connect_worker(app.clone()).await {
+                Ok(()) => {
+                    log_line(&app, "Worker reconnect attempt completed");
+                    break;
+                }
+                Err(error) => {
+                    log_line(&app, format!("Worker reconnect failed: {error}"));
+                    delay = (delay * 2).min(WORKER_RECONNECT_MAX_DELAY);
+                }
+            }
+        }
+    });
 }
 
 pub async fn sync_server_worker_settings(
@@ -942,7 +1014,7 @@ async fn worker_socket_loop(
     worker_token: String,
     mut shutdown: oneshot::Receiver<()>,
     ready_tx: oneshot::Sender<Result<(), String>>,
-) -> AppResult<()> {
+) -> AppResult<WorkerSocketExit> {
     let state = app.state::<ManagedState>();
     let config = load_config(&state.paths)?;
     let socket_url = worker_socket_url(&config.api_url)?;
@@ -973,17 +1045,33 @@ async fn worker_socket_loop(
 
     let active_job: Arc<AsyncMutex<Option<ActiveJobControl>>> = Arc::new(AsyncMutex::new(None));
     let mut ready_tx = Some(ready_tx);
+    let idle_timeout = tokio::time::sleep(WORKER_SOCKET_IDLE_TIMEOUT);
+    tokio::pin!(idle_timeout);
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 cancel_active_job(&active_job).await;
-                break;
+                drop(out_tx);
+                writer.abort();
+                return Ok(WorkerSocketExit::Shutdown);
+            }
+            _ = &mut idle_timeout => {
+                cancel_active_job(&active_job).await;
+                drop(out_tx);
+                writer.abort();
+                return Err(AppError::Process(format!(
+                    "worker socket idle timeout after {}s",
+                    WORKER_SOCKET_IDLE_TIMEOUT.as_secs()
+                )));
             }
             message = read.next() => {
+                idle_timeout.as_mut().reset(TokioInstant::now() + WORKER_SOCKET_IDLE_TIMEOUT);
                 let Some(message) = message else {
                     cancel_active_job(&active_job).await;
-                    break;
+                    drop(out_tx);
+                    writer.abort();
+                    return Ok(WorkerSocketExit::Closed);
                 };
                 let message = message?;
                 match message {
@@ -1025,17 +1113,15 @@ async fn worker_socket_loop(
                     Message::Ping(_) => {}
                     Message::Close(_) => {
                         cancel_active_job(&active_job).await;
-                        break;
+                        drop(out_tx);
+                        writer.abort();
+                        return Ok(WorkerSocketExit::Closed);
                     }
                     _ => {}
                 }
             }
         }
     }
-
-    drop(out_tx);
-    writer.abort();
-    Ok(())
 }
 
 async fn handle_worker_socket_event(
