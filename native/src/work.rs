@@ -66,6 +66,9 @@ const HUD_CONFIG_JSON_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const RENDERER_OUTPUT_TAIL_BYTES: usize = 12 * 1024;
 const RENDERER_OUTPUT_LINE_BYTES: usize = 2 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DOWNLOAD_MAX_ATTEMPTS: usize = 4;
+const DOWNLOAD_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+const DOWNLOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const FLAG_CDN_BASE_URL: &str = "https://flagcdn.com/h40";
 const MIRU_AUTOPLAY_COUNTRY_CODE: &str = "EC";
@@ -1250,7 +1253,7 @@ async fn handle_job(
             log_line(&app, format!("Worker job cancelled {}", job.id));
         }
         Err(err) => {
-            let message = err.to_string();
+            let message = sanitize_error_message(&err.to_string());
             queue_worker_error(&out_tx, &job.id, &attempt_id, &message)?;
             add_history(
                 &app,
@@ -2470,6 +2473,58 @@ async fn download_file_with_limits(
     }
 
     let url = resolve_worker_url(source_url, api_base_url)?;
+    let mut delay = DOWNLOAD_RETRY_INITIAL_DELAY;
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        match download_http_file_with_limits(
+            app,
+            &url,
+            destination_path,
+            max_bytes,
+            budget,
+            cancel_rx,
+        )
+        .await
+        {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let retryable = is_retryable_download_error(&error);
+                let _ = fs::remove_file(destination_path).await;
+                if !retryable || attempt == DOWNLOAD_MAX_ATTEMPTS {
+                    return Err(error);
+                }
+
+                log_line(
+                    app,
+                    format!(
+                        "Input download failed; retrying {}/{} in {}s: {}",
+                        attempt + 1,
+                        DOWNLOAD_MAX_ATTEMPTS,
+                        delay.as_secs(),
+                        sanitize_error_message(&error.to_string())
+                    ),
+                );
+                tokio::select! {
+                    _ = wait_for_cancel(cancel_rx) => {
+                        return Err(AppError::Process("Render cancelled".to_string()));
+                    }
+                    _ = sleep(delay) => {}
+                }
+                delay = (delay * 2).min(DOWNLOAD_RETRY_MAX_DELAY);
+            }
+        }
+    }
+
+    Err(AppError::Process("download retry loop exited".to_string()))
+}
+
+async fn download_http_file_with_limits(
+    app: &AppHandle,
+    url: &str,
+    destination_path: &Path,
+    max_bytes: u64,
+    budget: &mut ByteBudget,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> AppResult<u64> {
     let state = app.state::<ManagedState>();
     let response = timeout(DOWNLOAD_TIMEOUT, state.http.get(url).send())
         .await
@@ -2507,6 +2562,60 @@ async fn download_file_with_limits(
     }
     budget.used_bytes += bytes_written;
     Ok(bytes_written)
+}
+
+fn is_retryable_download_error(error: &AppError) -> bool {
+    match error {
+        AppError::Http(error) => {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                || error.status().is_some_and(|status| {
+                    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+                })
+        }
+        AppError::Process(message) => {
+            let message = message.to_lowercase();
+            message.contains("download timed out")
+                || message.contains("connection reset")
+                || message.contains("connection closed")
+                || message.contains("socket")
+                || message.contains("tls")
+                || message.contains("dns")
+        }
+        AppError::InvalidInput(message) => message == "downloaded file is empty",
+        _ => false,
+    }
+}
+
+fn sanitize_error_message(message: &str) -> String {
+    let mut sanitized = message.to_string();
+    for name in ["token", "accessToken", "refreshToken", "code"] {
+        sanitized = redact_query_param(&sanitized, name);
+    }
+    sanitized
+}
+
+fn redact_query_param(input: &str, name: &str) -> String {
+    let needle = format!("{name}=");
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(index) = remaining.find(&needle) {
+        let value_start = index + needle.len();
+        output.push_str(&remaining[..value_start]);
+        output.push_str("[REDACTED]");
+
+        let rest = &remaining[value_start..];
+        let value_end = rest
+            .find(|ch: char| matches!(ch, '&' | ')' | '"' | '\'' | ' ' | '\n' | '\r' | '\t'))
+            .unwrap_or(rest.len());
+        remaining = &rest[value_end..];
+    }
+
+    output.push_str(remaining);
+    output
 }
 
 fn decode_data_url_bytes(source_url: &str) -> AppResult<Option<Vec<u8>>> {

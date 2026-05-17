@@ -1,6 +1,6 @@
 [package]
 name = "miru_desktop_client"
-version = "0.1.12"
+version = "0.1.13"
 description = "Desktop client for Miru auto rendering and contributed render workers"
 authors = ["eiewm"]
 license-file = "../LICENSE"
