@@ -303,9 +303,10 @@ pub async fn require_auth_response(
                 "session refreshed; retry the action".to_string(),
             ));
         }
-        return Err(AppError::Auth(
-            api_error.unwrap_or_else(|| SESSION_EXPIRED_MESSAGE.to_string()),
-        ));
+        if let Some(detail) = api_error {
+            log_line(app, format!("Desktop session rejected by API: {detail}"));
+        }
+        return Err(AppError::Auth(SESSION_EXPIRED_MESSAGE.to_string()));
     }
 
     Err(AppError::Api(api_error.unwrap_or_else(|| {
