@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "miru_desktop_client"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "base64 0.22.1",
  "chrono",

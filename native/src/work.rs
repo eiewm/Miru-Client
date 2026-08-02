@@ -44,7 +44,9 @@ const DEFAULT_JOB_MAX_RENDER_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_REPLAY_SECONDS: u32 = 30;
 const MAX_BENCHMARK_REPLAY_SECONDS: u32 = 30;
 const DEFAULT_PUBLIC_SLOT_TOTAL: i64 = 5;
-const WORKER_PROTOCOL_VERSION: u8 = 3;
+// 4 tells the server this worker renders 9:16 jobs; older ones are not handed
+// any, because they reject the swapped resolution as unknown.
+const WORKER_PROTOCOL_VERSION: u8 = 4;
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const WORKER_SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const WORKER_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(10);
@@ -3192,8 +3194,12 @@ fn validate_job_assignment(job: &JobAssignment) -> AppResult<()> {
 }
 
 fn assert_allowed_resolution(resolution: &WorkerResolution) -> AppResult<()> {
-    let allowed_resolution = (resolution.width == 1280 && resolution.height == 720)
-        || (resolution.width == 1920 && resolution.height == 1080);
+    // A 9:16 job is the same frame with its sides swapped, not another
+    // resolution, so both orders of each pair are the same allowance.
+    let allowed_resolution = matches!(
+        (resolution.width, resolution.height),
+        (1280, 720) | (720, 1280) | (1920, 1080) | (1080, 1920)
+    );
     let allowed_fps = resolution.fps == 60;
     if allowed_resolution && allowed_fps {
         Ok(())
